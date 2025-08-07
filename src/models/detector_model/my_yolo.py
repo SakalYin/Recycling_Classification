@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset
-from PIL import Image
-import json
+from PIL import Image, ImageDraw
+import json, os
 import random
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -32,14 +32,33 @@ class YOLO(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(256 * (grid_size // 4)**2, grid_size * grid_size * (num_anchors * 5 + num_classes)),
+            nn.AdaptiveAvgPool2d((grid_size, grid_size)), 
+            nn.Conv2d(256, num_anchors * (5 + num_classes), kernel_size=1)
         )
 
     def forward(self, x):
-        features = self.backbone(x)
-        predictions = self.detector(features)
-        return predictions.view(-1, self.grid_size, self.grid_size, self.num_anchors * 5 + self.num_classes * self.num_anchors)
+        x = self.backbone(x)
+        x = self.detector(x)  # shape: [B, A*(5+C), S, S]
+        x = x.permute(0, 2, 3, 1).contiguous()  # [B, S, S, A*(5+C)]
+        x = x.view(x.size(0), x.size(1), x.size(2), self.num_anchors * (5 + self.num_classes))
+        return x
+    
+    def count_parameters(self):
+        model = self
+        """
+        Count total and trainable parameters in a PyTorch model
+        """
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        non_trainable_params = total_params - trainable_params
+
+        print(f"{'='*50}")
+        print(f"MODEL PARAMETER SUMMARY")
+        print(f"{'='*50}")
+        print(f"Total parameters:      {total_params:,}")
+        print(f"Trainable parameters:  {trainable_params:,}")
+        print(f"Non-trainable params:  {non_trainable_params:,}")
+        print(f"{'='*50}")
     
 
 class YOLOTrainingProcessor:
@@ -135,45 +154,62 @@ class YOLOTrainingProcessor:
 
     
     def apply_random_crop(self, image, boxes, p=0.3):
-        """Apply random crop augmentation (simplified version)"""
+        """Apply random crop + rescale, and adjust bounding boxes accordingly"""
         if random.random() < p and len(boxes) > 0:
-            width, height = image.size
-            
-            # Simple crop - take 80-100% of image
+            orig_width, orig_height = image.size
+
+            # Crop factor and crop area
             crop_factor = random.uniform(0.8, 1.0)
-            new_width = int(width * crop_factor)
-            new_height = int(height * crop_factor)
-            
-            left = random.randint(0, width - new_width)
-            top = random.randint(0, height - new_height)
-            
-            image = image.crop((left, top, left + new_width, top + new_height))
-            
+            new_width = int(orig_width * crop_factor)
+            new_height = int(orig_height * crop_factor)
+
+            left = random.randint(0, orig_width - new_width)
+            top = random.randint(0, orig_height - new_height)
+            right = left + new_width
+            bottom = top + new_height
+
+            # Crop image
+            image = image.crop((left, top, right, bottom))
+
+            # Resize back to original size
+            image = image.resize((orig_width, orig_height))
+
             # Adjust bounding boxes
             adjusted_boxes = []
+            scale_x = orig_width / new_width
+            scale_y = orig_height / new_height
+
             for box in boxes:
                 x1, y1, x2, y2, class_id = box
-                
-                # Adjust coordinates
-                x1 -= left
-                y1 -= top
-                x2 -= left
-                y2 -= top
-                
-                # Check if box is still valid after crop
-                if x2 > 0 and y2 > 0 and x1 < new_width and y1 < new_height:
-                    # Clamp to image boundaries
-                    x1 = max(0, x1)
-                    y1 = max(0, y1)
-                    x2 = min(new_width, x2)
-                    y2 = min(new_height, y2)
-                    
-                    # Only keep if box is still reasonable size
-                    if (x2 - x1) > 10 and (y2 - y1) > 10:
-                        adjusted_boxes.append([x1, y1, x2, y2, class_id])
-            
+
+                # Translate relative to crop
+                new_x1 = x1 - left
+                new_y1 = y1 - top
+                new_x2 = x2 - left
+                new_y2 = y2 - top
+
+                # Skip if box completely outside crop
+                if new_x2 <= 0 or new_y2 <= 0 or new_x1 >= new_width or new_y1 >= new_height:
+                    continue
+
+                # Clamp box to crop region
+                new_x1 = max(0, min(new_x1, new_width))
+                new_y1 = max(0, min(new_y1, new_height))
+                new_x2 = max(0, min(new_x2, new_width))
+                new_y2 = max(0, min(new_y2, new_height))
+
+                # Scale to original size
+                final_x1 = new_x1 * scale_x
+                final_y1 = new_y1 * scale_y
+                final_x2 = new_x2 * scale_x
+                final_y2 = new_y2 * scale_y
+
+                # Filter out too-small boxes
+                if (final_x2 - final_x1) > 10 and (final_y2 - final_y1) > 10:
+                    adjusted_boxes.append([final_x1, final_y1, final_x2, final_y2, class_id])
+
             return image, adjusted_boxes
-        
+
         return image, boxes
     
     def convert_to_yolo_target(self, boxes, original_size, get_anchors=False):
@@ -214,6 +250,10 @@ class YOLOTrainingProcessor:
             # Clamp to grid boundaries
             grid_x = min(grid_x, self.grid_size - 1)
             grid_y = min(grid_y, self.grid_size - 1)
+
+            if anchor_counter[grid_y, grid_x] >= self.num_anchors:
+                print(f"Warning: Too many anchors for cell ({grid_y}, {grid_x}). Skipping box.")
+                continue
             
             # Calculate relative position within the cell (0-1)
             cell_x = (center_x * self.grid_size) - grid_x
@@ -260,8 +300,8 @@ class YOLOTrainingProcessor:
         
         # Apply augmentations if training
         if apply_augmentation:
-            image, boxes = self.apply_horizontal_flip(image, bboxes)
-            image, boxes = self.apply_random_crop(image, bboxes)
+            image, bboxes = self.apply_horizontal_flip(image, bboxes)
+            image, bboxes = self.apply_random_crop(image, bboxes)
         
         # Apply transforms
         if apply_augmentation:
@@ -346,6 +386,95 @@ class YOLOTrainingProcessor:
         
         plt.show()
 
+    def convert_yolo_output_to_bboxes(self, output_tensor, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None):
+        """
+        Converts [S, S, B*(5+num_classes)] YOLO-style output to absolute bboxes.
+        
+        Args:
+            output_tensor (Tensor): Shape [S, S, B*(5+num_classes)]
+            conf_threshold (float): Threshold for objectness score
+            input_size (int): Size of input image
+            num_classes (int): Number of classes
+            num_anchors (int): Anchors per cell
+
+        Returns:
+            List[Dict]: Each dict has keys: 'bbox', 'conf', 'class_id'
+        """
+        conf_threshold = conf_threshold if conf_threshold else 0.5
+        input_size = input_size if input_size else self.input_size
+        num_classes = num_classes if num_classes else self.num_classes
+        num_anchors = num_anchors if num_anchors else self.num_anchors
+        grid_size = grid_size if grid_size else self.grid_size
+
+        cell_size = input_size / grid_size
+        boxes = []
+
+        for i in range(grid_size):
+            for j in range(grid_size):
+                for anchor in range(num_anchors):
+                    anchor_base = anchor * 5
+                    anchor_data = output_tensor[i, j, anchor_base : anchor_base + 5]
+
+                    tx, ty, tw, th, conf = anchor_data
+                    if conf.item() < conf_threshold:
+                        continue
+                    
+                    class_base = (num_anchors * 5) + anchor * num_classes
+                    class_probs = output_tensor[i, j, class_base: class_base + num_classes]
+
+                    # Convert to absolute coordinates
+                    center_x = (j + tx.item()) * cell_size
+                    center_y = (i + ty.item()) * cell_size
+                    width = tw.item() * input_size
+                    height = th.item() * input_size
+
+                    x1 = center_x - width / 2
+                    y1 = center_y - height / 2
+
+                    class_id = torch.argmax(class_probs).item()
+
+                    boxes.append({
+                        'bbox': [x1, y1, width, height],
+                        'conf': conf.item(),
+                        'class_id': class_id
+                    })
+
+        return boxes
+    
+    def draw_bbox_on_image(self, image_tensor, bboxes, box_color="red", width=3, show=True, save_path=None):
+        """
+        Draw bounding boxes on an image using Pillow.
+
+        Parameters:
+            image_path (str): Path to the image.
+            bboxes (dict): Dictionary of bounding boxes, class name and other info
+            box_color (str or tuple): Color of bounding boxes.
+            width (int): Line width of the box.
+            show (bool): Whether to display the image.
+            save_path (str or None): If set, saves the resulting image to this path.
+        """
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        image = image_tensor * std + mean
+        image = torch.clamp(image, 0, 1)
+        
+        # Convert to PIL
+        image = transforms.ToPILImage()(image)
+        draw = ImageDraw.Draw(image)
+
+        for bbox in bboxes:
+            x, y, w, h = bbox['bbox']
+            draw.rectangle([x, y, x + w, y + h], outline=box_color, width=width)
+            draw.text((x, y - 10), self.class_names[bbox['class_id']], fill=box_color)
+
+        if show:
+            image.show()
+
+        if save_path:
+            image.save(save_path)
+
+        return image
+
 
 class YOLODataset(Dataset):
     """PyTorch Dataset for YOLO training"""
@@ -370,4 +499,53 @@ class YOLODataset(Dataset):
             # Return empty tensors as fallback
             return torch.zeros(3, self.processor.input_size, self.processor.input_size), \
                    torch.zeros(self.processor.grid_size, self.processor.grid_size, 
-                              self.processor.num_anchors * 5 + self.processor.num_classes)
+                              self.processor.num_anchors * (5 + self.processor.num_classes))
+
+class COCOProcessor:
+    def __init__(self, classes):
+        self.group_classes = classes
+
+    def get_grouped_class(self, class_name):
+        class_name = class_name.strip()
+
+        for group, items in self.group_classes.items():
+            if class_name in items:
+                return group
+        print(f"Class '{class_name}' not found in grouped classes.")
+        return "Other"        
+
+    def extract_annotations(self, json_path, image_dir, image_id=None, convert=False):
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        labels = []
+        # Select image
+        images = data['images']
+        annotations = data['annotations']
+        categories = {cat['id']: cat['name'] for cat in data['categories']}
+
+        for img in images:
+            if image_id and img['id'] != image_id:
+                continue
+
+            image_path = os.path.join(image_dir, img['file_name'])
+            size = (img['width'], img['height'])
+            bboxes = []
+            classes = []
+            for ann in annotations:
+                if ann['image_id'] != img['id']:
+                    continue
+                bboxes.append(ann['bbox'])
+                if convert:
+                    class_name = categories[ann['category_id']]
+                    grouped_class = self.get_grouped_class(class_name)
+                    classes.append(grouped_class)
+                else:
+                    classes.append(categories[ann['category_id']])
+                    
+            label = {"Path": image_path,
+                    "Size": size,
+                    "Bbox": bboxes,
+                    "Class": classes}
+                                    
+            labels.append(label)
+        return labels
