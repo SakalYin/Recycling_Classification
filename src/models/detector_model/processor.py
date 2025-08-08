@@ -1,67 +1,10 @@
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset
 from PIL import Image, ImageDraw
-import json, os
-import random
+import torch, random
+import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-class YOLO(nn.Module):
-    def __init__(self, num_classes=20, num_anchors=3, grid_size=7):
-        super(YOLO, self).__init__()
-        self.num_classes = num_classes
-        self.num_anchors = num_anchors
-        self.grid_size = grid_size
-
-        # Backbone: Feature extractor (e.g., simplified CNN for demonstration)
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-
-        # Detection Head: Outputs bounding boxes, confidence scores, and class probabilities
-        self.detector = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((grid_size, grid_size)), 
-            nn.Conv2d(256, num_anchors * (5 + num_classes), kernel_size=1)
-        )
-
-    def forward(self, x):
-        x = self.backbone(x)
-        x = self.detector(x)  # shape: [B, A*(5+C), S, S]
-        x = x.permute(0, 2, 3, 1).contiguous()  # [B, S, S, A*(5+C)]
-        x = x.view(x.size(0), x.size(1), x.size(2), self.num_anchors * (5 + self.num_classes))
-        return x
-    
-    def count_parameters(self):
-        model = self
-        """
-        Count total and trainable parameters in a PyTorch model
-        """
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        non_trainable_params = total_params - trainable_params
-
-        print(f"{'='*50}")
-        print(f"MODEL PARAMETER SUMMARY")
-        print(f"{'='*50}")
-        print(f"Total parameters:      {total_params:,}")
-        print(f"Trainable parameters:  {trainable_params:,}")
-        print(f"Non-trainable params:  {non_trainable_params:,}")
-        print(f"{'='*50}")
-    
-
-class YOLOTrainingProcessor:
+class TrainingProcessor:
     def __init__(self, classes, input_size=448, grid_size=7, num_anchors=1):
         """
         Initialize YOLO training data processor
@@ -78,13 +21,15 @@ class YOLOTrainingProcessor:
         self.num_anchors = num_anchors
         self.cell_size = input_size / grid_size
         self.class_names = classes
+        self.transform_mean = [0.485, 0.456, 0.406]
+        self.transform_std = [0.229, 0.224, 0.225]
         
         # Training transforms with augmentation
         self.train_transforms = transforms.Compose([
             transforms.Resize((input_size, input_size)),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=self.transform_mean, std=self.transform_std)
         ])
         
         # Validation transforms (no augmentation)
@@ -212,7 +157,7 @@ class YOLOTrainingProcessor:
 
         return image, boxes
     
-    def convert_to_yolo_target(self, boxes, original_size, get_anchors=False):
+    def convert_to_yolo_target(self, boxes, original_size, get_anchors=False, warning=False):
         """
         Convert bounding boxes to YOLO training target format
         
@@ -250,9 +195,10 @@ class YOLOTrainingProcessor:
             # Clamp to grid boundaries
             grid_x = min(grid_x, self.grid_size - 1)
             grid_y = min(grid_y, self.grid_size - 1)
-
+            
             if anchor_counter[grid_y, grid_x] >= self.num_anchors:
-                print(f"Warning: Too many anchors for cell ({grid_y}, {grid_x}). Skipping box.")
+                if warning:
+                    print(f"Warning: Too many anchors for cell ({grid_y}, {grid_x}). Skipping box.")
                 continue
             
             # Calculate relative position within the cell (0-1)
@@ -386,7 +332,7 @@ class YOLOTrainingProcessor:
         
         plt.show()
 
-    def convert_yolo_output_to_bboxes(self, output_tensor, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None):
+    def convert_yolo_output_to_bboxes(self, output_tensor, class_tensor=False, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None, is_training=True):
         """
         Converts [S, S, B*(5+num_classes)] YOLO-style output to absolute bboxes.
         
@@ -396,15 +342,16 @@ class YOLOTrainingProcessor:
             input_size (int): Size of input image
             num_classes (int): Number of classes
             num_anchors (int): Anchors per cell
-
+            is_training (bool): Whether in training mode (return tensors) or eval mode (return Python scalars)
+            
         Returns:
-            List[Dict]: Each dict has keys: 'bbox', 'conf', 'class_id'
+            List[Dict]: Each dict has keys: 'bbox', 'conf', 'class_id', optionally 'class_tensor'
         """
-        conf_threshold = conf_threshold if conf_threshold else 0.5
-        input_size = input_size if input_size else self.input_size
-        num_classes = num_classes if num_classes else self.num_classes
-        num_anchors = num_anchors if num_anchors else self.num_anchors
-        grid_size = grid_size if grid_size else self.grid_size
+        conf_threshold = conf_threshold if conf_threshold is not None else 0.5
+        input_size = input_size if input_size is not None else self.input_size
+        num_classes = num_classes if num_classes is not None else self.num_classes
+        num_anchors = num_anchors if num_anchors is not None else self.num_anchors
+        grid_size = grid_size if grid_size is not None else self.grid_size
 
         cell_size = input_size / grid_size
         boxes = []
@@ -415,33 +362,58 @@ class YOLOTrainingProcessor:
                     anchor_base = anchor * 5
                     anchor_data = output_tensor[i, j, anchor_base : anchor_base + 5]
 
-                    tx, ty, tw, th, conf = anchor_data
-                    if conf.item() < conf_threshold:
+                    tx = anchor_data[0]
+                    ty = anchor_data[1]
+                    tw = anchor_data[2]
+                    th = anchor_data[3]
+                    conf = anchor_data[4]
+
+                    if (not is_training and conf.item() < conf_threshold) or (is_training and conf < conf_threshold):
                         continue
                     
                     class_base = (num_anchors * 5) + anchor * num_classes
                     class_probs = output_tensor[i, j, class_base: class_base + num_classes]
 
-                    # Convert to absolute coordinates
-                    center_x = (j + tx.item()) * cell_size
-                    center_y = (i + ty.item()) * cell_size
-                    width = tw.item() * input_size
-                    height = th.item() * input_size
+                    # Coordinates calculations
+                    center_x = (j + (tx.item() if not is_training else tx)) * cell_size
+                    center_y = (i + (ty.item() if not is_training else ty)) * cell_size
+                    width = (tw.item() if not is_training else tw) * input_size
+                    height = (th.item() if not is_training else th) * input_size
 
-                    x1 = center_x - width / 2
-                    y1 = center_y - height / 2
+                    if is_training:
+                        bbox = torch.stack([center_x - width / 2, center_y - height / 2, width, height])
+                        conf_val = conf
+                        class_id_val = torch.argmax(class_probs).item()  # class index as int is fine
+                        class_tensor_val = class_probs
+                    else:
+                        bbox = [
+                            center_x.item() - width.item() / 2,
+                            center_y.item() - height.item() / 2,
+                            width.item(),
+                            height.item()
+                        ]
+                        conf_val = conf.item()
+                        class_id_val = torch.argmax(class_probs).item()
+                        class_tensor_val = class_probs.detach().cpu().numpy() if class_tensor else None
 
-                    class_id = torch.argmax(class_probs).item()
-
-                    boxes.append({
-                        'bbox': [x1, y1, width, height],
-                        'conf': conf.item(),
-                        'class_id': class_id
-                    })
+                    if class_tensor:
+                        boxes.append({
+                            'bbox': bbox,
+                            'conf': conf_val,
+                            'class_id': class_id_val,
+                            'class_tensor': class_tensor_val
+                        })
+                    else:
+                        boxes.append({
+                            'bbox': bbox,
+                            'conf': conf_val,
+                            'class_id': class_id_val
+                        })
 
         return boxes
+
     
-    def draw_bbox_on_image(self, image_tensor, bboxes, box_color="red", width=3, show=True, save_path=None):
+    def draw_bbox_on_image(self, image, bboxes, tensor=True, box_color="red", width=3, show=True, save_path=None):
         """
         Draw bounding boxes on an image using Pillow.
 
@@ -453,13 +425,15 @@ class YOLOTrainingProcessor:
             show (bool): Whether to display the image.
             save_path (str or None): If set, saves the resulting image to this path.
         """
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        image = image_tensor * std + mean
-        image = torch.clamp(image, 0, 1)
+        if tensor:
+            mean = torch.tensor(self.transform_mean).view(3, 1, 1)
+            std = torch.tensor(self.transform_std).view(3, 1, 1)
+            image = image * std + mean
+            image = torch.clamp(image, 0, 1)
+            image = transforms.ToPILImage()(image)
+        else:
+            self.val_transforms(image)
         
-        # Convert to PIL
-        image = transforms.ToPILImage()(image)
         draw = ImageDraw.Draw(image)
 
         for bbox in bboxes:
@@ -474,78 +448,3 @@ class YOLOTrainingProcessor:
             image.save(save_path)
 
         return image
-
-
-class YOLODataset(Dataset):
-    """PyTorch Dataset for YOLO training"""
-    def __init__(self, data_json, processor, is_training=True):
-        self.data = data_json   
-        self.processor = processor
-        self.is_training = is_training
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        image_path = self.data[idx]['Path']
-        
-        try:
-            image_tensor, target_tensor = self.processor.process_training_sample(
-                self.data[idx],
-                apply_augmentation=self.is_training)
-            return image_tensor, target_tensor
-        except Exception as e:
-            print(f"Error processing {image_path}: {e}")
-            # Return empty tensors as fallback
-            return torch.zeros(3, self.processor.input_size, self.processor.input_size), \
-                   torch.zeros(self.processor.grid_size, self.processor.grid_size, 
-                              self.processor.num_anchors * (5 + self.processor.num_classes))
-
-class COCOProcessor:
-    def __init__(self, classes):
-        self.group_classes = classes
-
-    def get_grouped_class(self, class_name):
-        class_name = class_name.strip()
-
-        for group, items in self.group_classes.items():
-            if class_name in items:
-                return group
-        print(f"Class '{class_name}' not found in grouped classes.")
-        return "Other"        
-
-    def extract_annotations(self, json_path, image_dir, image_id=None, convert=False):
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        labels = []
-        # Select image
-        images = data['images']
-        annotations = data['annotations']
-        categories = {cat['id']: cat['name'] for cat in data['categories']}
-
-        for img in images:
-            if image_id and img['id'] != image_id:
-                continue
-
-            image_path = os.path.join(image_dir, img['file_name'])
-            size = (img['width'], img['height'])
-            bboxes = []
-            classes = []
-            for ann in annotations:
-                if ann['image_id'] != img['id']:
-                    continue
-                bboxes.append(ann['bbox'])
-                if convert:
-                    class_name = categories[ann['category_id']]
-                    grouped_class = self.get_grouped_class(class_name)
-                    classes.append(grouped_class)
-                else:
-                    classes.append(categories[ann['category_id']])
-                    
-            label = {"Path": image_path,
-                    "Size": size,
-                    "Bbox": bboxes,
-                    "Class": classes}
-                                    
-            labels.append(label)
-        return labels
