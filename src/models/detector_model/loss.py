@@ -331,24 +331,24 @@ class ObjectDetectionLoss(nn.Module):
                         if best_pred_idx is not None:
                             best_pred = grid_preds[best_pred_idx]
                             
-                            # Calculate losses with 1.5 weight for this assignment
+                            # Calculate losses
                             pred_bbox = best_pred['bbox'].to(device)
                             gt_bbox = self._ensure_tensor(gt['bbox'], device)
                             pred_conf = best_pred['conf'].unsqueeze(0).to(device)
                             pred_class = best_pred['class_tensor'].to(device)
                             
-                            # SIoU loss with 1.5 weight
-                            siou_loss = self.siou_loss(pred_bbox, gt_bbox) * 1.5
+                            # SIoU loss
+                            siou_loss = self.siou_loss(pred_bbox, gt_bbox)
                             siou_losses.append(siou_loss)
                             
-                            # Objectness loss with soft target based on IoU, with 1.5 weight
+                            # Objectness loss with soft target based on IoU
                             soft_target = torch.clamp(best_iou, min=0.3, max=0.8)
-                            obj_loss = self.binary_focal_loss(pred_conf, soft_target.unsqueeze(0), device) * 1.5
+                            obj_loss = self.binary_focal_loss(pred_conf, soft_target.unsqueeze(0), device)
                             obj_losses.append(obj_loss)
                             
-                            # Classification loss with 1.5 weight
+                            # Classification loss
                             target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
-                            cls_loss = self.multi_focal_loss(pred_class, target_class, device) * 1.5
+                            cls_loss = self.multi_focal_loss(pred_class, target_class, device)
                             cls_losses.append(cls_loss)
                             
                             # Mark this prediction as assigned
