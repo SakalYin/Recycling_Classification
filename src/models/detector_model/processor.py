@@ -97,7 +97,6 @@ class TrainingProcessor:
 
         return image, boxes
 
-    
     def apply_random_crop(self, image, boxes, p=0.3):
         """Apply random crop + rescale, and adjust bounding boxes accordingly"""
         if random.random() < p and len(boxes) > 0:
