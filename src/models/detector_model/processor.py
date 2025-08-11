@@ -332,7 +332,7 @@ class TrainingProcessor:
         
         plt.show()
 
-    def convert_yolo_output_to_bboxes(self, output_tensor, class_tensor=False, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None, is_training=True):
+    def convert_yolo_output_to_bboxes(self, output_tensor, class_tensor=False, grid=False, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None, is_training=True):
         """
         Converts [S, S, B*(5+num_classes)] YOLO-style output to absolute bboxes.
         
@@ -345,7 +345,7 @@ class TrainingProcessor:
             is_training (bool): Whether in training mode (return tensors) or eval mode (return Python scalars)
             
         Returns:
-            List[Dict]: Each dict has keys: 'bbox', 'conf', 'class_id', optionally 'class_tensor'
+            List[Dict]: Each dict has keys: 'bbox', 'conf', 'class_id', optionally 'class_tensor' adn 'grid'
         """
         conf_threshold = conf_threshold if conf_threshold is not None else 0.5
         input_size = input_size if input_size is not None else self.input_size
@@ -396,20 +396,18 @@ class TrainingProcessor:
                         class_id_val = torch.argmax(class_probs).item()
                         class_tensor_val = class_probs.detach().cpu().numpy() if class_tensor else None
 
-                    if class_tensor:
-                        boxes.append({
+                    box = {
                             'bbox': bbox,
                             'conf': conf_val,
                             'class_id': class_id_val,
-                            'class_tensor': class_tensor_val
-                        })
-                    else:
-                        boxes.append({
-                            'bbox': bbox,
-                            'conf': conf_val,
-                            'class_id': class_id_val
-                        })
+                        }
 
+                    if class_tensor:
+                        box['class_tensor'] = class_tensor_val
+                    if grid:
+                        box['grid'] = (i,j)
+
+                    boxes.append(box)
         return boxes
 
     

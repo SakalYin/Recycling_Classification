@@ -137,7 +137,7 @@ class FocalLoss(nn.Module):
 class ObjectDetectionLoss(nn.Module):
     def __init__(self, processor, classes_alpha, eps=1e-7):
         """
-        Gradient-safe object detection loss implementation.
+        Grid-based object detection loss implementation.
         
         Args:
             processor: Object detection processor
@@ -150,16 +150,21 @@ class ObjectDetectionLoss(nn.Module):
         self.siou_loss = SIoU(x1y1x2y2=False)
         self.binary_focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
         self.multi_focal_loss = FocalLoss(alpha=classes_alpha, gamma=2.0, num_classes=processor.num_classes)
+        
+        # Get grid dimensions from processor
+        self.grid_size = processor.grid_size  # Assuming processor has grid_size attribute
+        self.num_anchors = processor.num_anchors  # Assuming processor has num_anchors
     
     def forward(self, outputs, targets):
         """
+        Grid-based loss calculation
         outputs: Tensor of shape [B, S, S, A, 5 + C]
         targets: Tensor of shape [B, S, S, A, 5 + C]
         """
         batch_size = outputs.shape[0]
         device = outputs.device
         
-        # Initialize loss accumulators with proper gradient tracking
+        # Initialize loss accumulators
         total_siou = torch.zeros(1, device=device, requires_grad=True)
         total_obj = torch.zeros(1, device=device, requires_grad=True)
         total_cls = torch.zeros(1, device=device, requires_grad=True)
@@ -168,12 +173,16 @@ class ObjectDetectionLoss(nn.Module):
             output = outputs[i]
             target = targets[i]
 
-            pred_data = self.processor.convert_yolo_output_to_bboxes(output, class_tensor=True, is_training=True)
-            gt_data = self.processor.convert_yolo_output_to_bboxes(target, class_tensor=True, is_training=True)
+            # Convert to grid-based format with grid coordinates
+            pred_data = self.processor.convert_yolo_output_to_bboxes(
+                output, grid=True, class_tensor=True, is_training=True
+            )
+            gt_data = self.processor.convert_yolo_output_to_bboxes(
+                target, grid=True, class_tensor=True, is_training=True
+            )
 
-            loss_dict = self._compute_single_image_loss(pred_data, gt_data, device)
+            loss_dict = self._compute_single_image_loss_grid_based(pred_data, gt_data, device)
             
-            # Use proper addition to maintain gradient flow
             total_siou = total_siou + loss_dict["siou"]
             total_obj = total_obj + loss_dict["objectness"]
             total_cls = total_cls + loss_dict["classification"]
@@ -183,133 +192,230 @@ class ObjectDetectionLoss(nn.Module):
         total_loss = (total_siou + total_obj + total_cls) / batch_size_tensor
         return total_loss.squeeze()
 
-    def _compute_single_image_loss(self, pred_data, gt_data, device):
+    def _compute_single_image_loss_grid_based(self, pred_data, gt_data, device):
         """
-        Compute loss for a single image with gradient-safe operations.
+        Compute loss for a single image using grid-based matching.
+        Each prediction and ground truth has a 'grid' key indicating its grid cell (i, j).
         """
-        # Initialize loss tensors with gradient tracking
-        total_siou_loss = torch.zeros(1, device=device, requires_grad=True)
-        total_obj_loss = torch.zeros(1, device=device, requires_grad=True)
-        total_cls_loss = torch.zeros(1, device=device, requires_grad=True)
-        num_matched = 0
-
-        if len(gt_data) == 0:
-            # Handle empty cases
-            # print('Empty')
-            for pred in pred_data:
-                pred_conf = pred['conf'].unsqueeze(0)
-                neg_target = torch.zeros_like(pred_conf, device=device)
-                total_obj_loss = total_obj_loss + self.binary_focal_loss(pred_conf, neg_target, device=device)
-                
-            return {
-                "total": total_siou_loss + total_obj_loss + total_cls_loss,
-                "siou": total_siou_loss,
-                "objectness": total_obj_loss,
-                "classification": total_cls_loss
-            }
-
-        # Compute IoU matrix between all predictions and ground truths
-        iou_matrix = self._compute_iou_matrix(pred_data, gt_data, device)
+        # Organize data by grid cells for efficient matching
+        pred_by_grid = self._organize_by_grid(pred_data)
+        gt_by_grid = self._organize_by_grid(gt_data)
         
-        # Find best matches for each ground truth
-        matches = []
-        used_preds = set()
+        # Initialize loss lists
+        siou_losses = []
+        obj_losses = []
+        cls_losses = []
         
-        for gt_idx in range(len(gt_data)):
-            best_iou_val = torch.tensor(0.0, device=device)
-            best_pred_idx = -1
+        # Get all unique grid cells that have either predictions or ground truths
+        all_grids = set(pred_by_grid.keys()) | set(gt_by_grid.keys())
+        
+        for grid_coord in all_grids:
+            grid_preds = pred_by_grid.get(grid_coord, [])
+            grid_gts = gt_by_grid.get(grid_coord, [])
             
-            for pred_idx in range(len(pred_data)):
-                if pred_idx not in used_preds:
-                    iou_val = iou_matrix[pred_idx, gt_idx]
-                    if iou_val > best_iou_val:
-                        best_iou_val = iou_val
-                        best_pred_idx = pred_idx
+            # Compute loss for this specific grid cell
+            grid_losses = self._compute_grid_cell_loss(grid_preds, grid_gts, grid_coord, device)
             
-            # Use differentiable threshold check
-            if best_pred_idx >= 0:
-                threshold = torch.tensor(0.1, device=device)
-                is_match = (best_iou_val >= threshold).float()
-                
-                if is_match > 0:
-                    matches.append((best_pred_idx, gt_idx))
-                    used_preds.add(best_pred_idx)
-                    num_matched += 1
-
-        # Process positive matches
-        if matches:
-            for pred_idx, gt_idx in matches:
-                pred = pred_data[pred_idx]
-                gt = gt_data[gt_idx]
-                
-                # Ensure tensors are on correct device and maintain gradients
-                pred_bbox = pred['bbox'].to(device)
-                gt_bbox = self._ensure_tensor(gt['bbox'], device)
-                pred_conf = pred['conf'].unsqueeze(0).to(device)
-                pred_class = pred['class_tensor'].to(device)
-                
-                # Compute losses
-                siou_loss = self.siou_loss(pred_bbox, gt_bbox)
-                obj_loss = self.binary_focal_loss(pred_conf, torch.ones_like(pred_conf, device=device), device)
-                target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
-                cls_loss = self.multi_focal_loss(pred_class, target_class, device)
-                
-                # Accumulate losses
-                total_siou_loss = total_siou_loss + siou_loss
-                total_obj_loss = total_obj_loss + obj_loss
-                total_cls_loss = total_cls_loss + cls_loss
-
-        # ------------------------------------------------------------------------
-        # TODO: how to penalize for non match
-        # ------------------------------------------------------------------------
-
-        # Process negative samples (unmatched predictions)
-        for pred_idx in range(len(pred_data)):
-            if pred_idx not in used_preds:
-                pred_conf = pred_data[pred_idx]['conf'].unsqueeze(0).to(device)
-                neg_target = torch.zeros_like(pred_conf, device=device)
-                total_obj_loss = total_obj_loss + self.binary_focal_loss(pred_conf, neg_target, device)
-
-                siou_loss = self.siou_loss(pred_bbox, gt_bbox)
-                target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
-                cls_loss = self.multi_focal_loss(pred_class, target_class, device)
-
-                total_siou_loss = total_siou_loss + siou_loss
-                total_cls_loss = total_cls_loss + cls_loss
-
-        # Normalize losses by number of matches (avoid division by zero)
-        if num_matched > 0:
-            num_matched_tensor = torch.tensor(float(num_matched), device=device)
-            total_siou_loss = total_siou_loss / num_matched_tensor
-            total_cls_loss = total_cls_loss / num_matched_tensor
-
+            # Accumulate losses
+            siou_losses.extend(grid_losses["siou"])
+            obj_losses.extend(grid_losses["objectness"])
+            cls_losses.extend(grid_losses["classification"])
+        
+        # Aggregate losses
+        total_siou_loss = sum(siou_losses) if siou_losses else torch.tensor(0.0, device=device, requires_grad=True)
+        total_obj_loss = sum(obj_losses) if obj_losses else torch.tensor(0.0, device=device, requires_grad=True)
+        total_cls_loss = sum(cls_losses) if cls_losses else torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Normalize regression and classification losses by number of positive samples
+        num_positive = len([loss for loss in siou_losses if loss > 0])
+        if num_positive > 0:
+            num_positive_tensor = torch.tensor(float(num_positive), device=device)
+            total_siou_loss = total_siou_loss / num_positive_tensor
+            total_cls_loss = total_cls_loss / num_positive_tensor
+        
         total_loss = total_siou_loss + total_obj_loss + total_cls_loss
-        # print(f'Matched: {num_matched}')
         
         return {
             "total": total_loss,
             "siou": total_siou_loss,
             "objectness": total_obj_loss,
-            "classification": total_cls_loss
+            "classification": total_cls_loss,
+            "num_positive": num_positive,
+            "num_grids_processed": len(all_grids)
         }
 
-    def _compute_iou_matrix(self, pred_data, gt_data, device):
+    def _organize_by_grid(self, data_list):
         """
-        Compute IoU matrix between all predictions and ground truths.
-        Returns a differentiable tensor of shape (num_preds, num_gts).
+        Organize predictions/ground truths by their grid coordinates.
+        Returns: dict where key is (grid_i, grid_j) and value is list of objects in that cell
         """
-        num_preds = len(pred_data)
-        num_gts = len(gt_data)
+        grid_dict = {}
+        for item in data_list:
+            grid_coord = item['grid']  # Should be tuple like (1, 2)
+            if grid_coord not in grid_dict:
+                grid_dict[grid_coord] = []
+            grid_dict[grid_coord].append(item)
+        return grid_dict
+
+    def _compute_grid_cell_loss(self, grid_preds, grid_gts, grid_coord, device):
+        """
+        Compute loss for a specific grid cell.
+        In YOLO, each grid cell is responsible for detecting objects whose center falls in that cell.
+        """
+        siou_losses = []
+        obj_losses = []
+        cls_losses = []
         
-        iou_matrix = torch.zeros(num_preds, num_gts, device=device)
+        if len(grid_gts) == 0:
+            # No ground truth in this grid cell - all predictions should be negative
+            for pred in grid_preds:
+                pred_conf = pred['conf'].unsqueeze(0)
+                neg_target = torch.zeros_like(pred_conf, device=device)
+                obj_loss = self.binary_focal_loss(pred_conf, neg_target, device=device)
+                obj_losses.append(obj_loss)
+        else:
+            # There are ground truths in this grid cell
+            # Match predictions to ground truths using IoU
+            matches = self._match_predictions_to_gts_in_grid(grid_preds, grid_gts, device)
+            
+            matched_preds = set()
+            matched_gts = set()
+            
+            # Process positive matches
+            for pred_idx, gt_idx, iou_val in matches:
+                pred = grid_preds[pred_idx]
+                gt = grid_gts[gt_idx]
+                
+                matched_preds.add(pred_idx)
+                matched_gts.add(gt_idx)
+                
+                # Compute losses for positive match
+                pred_bbox = pred['bbox'].to(device)
+                gt_bbox = self._ensure_tensor(gt['bbox'], device)
+                pred_conf = pred['conf'].unsqueeze(0).to(device)
+                pred_class = pred['class_tensor'].to(device)
+                
+                # Regression loss
+                siou_loss = self.siou_loss(pred_bbox, gt_bbox)
+                siou_losses.append(siou_loss)
+                
+                # Objectness loss (positive)
+                obj_loss = self.binary_focal_loss(pred_conf, torch.ones_like(pred_conf, device=device), device)
+                obj_losses.append(obj_loss)
+                
+                # Classification loss
+                target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
+                cls_loss = self.multi_focal_loss(pred_class, target_class, device)
+                cls_losses.append(cls_loss)
+            
+            # Process unmatched ground truths (missed detections in this grid)
+            for gt_idx, gt in enumerate(grid_gts):
+                if gt_idx not in matched_gts:
+                    # Option 2: Assign to best available prediction (if any unused ones exist)
+                    unused_preds = [i for i in range(len(grid_preds)) if i not in matched_preds]
+                    if unused_preds:
+                        # Find best unused prediction for this GT based on IoU
+                        best_pred_idx = None
+                        best_iou = torch.tensor(0.0, device=device)
+                        
+                        for pred_idx in unused_preds:
+                            pred = grid_preds[pred_idx]
+                            pred_bbox = pred['bbox'].to(device)
+                            gt_bbox = self._ensure_tensor(gt['bbox'], device)
+                            iou_val = self._bbox_iou_differentiable(pred_bbox, gt_bbox)
+                            
+                            if iou_val > best_iou:
+                                best_iou = iou_val
+                                best_pred_idx = pred_idx
+                        
+                        if best_pred_idx is not None:
+                            best_pred = grid_preds[best_pred_idx]
+                            
+                            # Calculate losses with 1.5 weight for this assignment
+                            pred_bbox = best_pred['bbox'].to(device)
+                            gt_bbox = self._ensure_tensor(gt['bbox'], device)
+                            pred_conf = best_pred['conf'].unsqueeze(0).to(device)
+                            pred_class = best_pred['class_tensor'].to(device)
+                            
+                            # SIoU loss with 1.5 weight
+                            siou_loss = self.siou_loss(pred_bbox, gt_bbox) * 1.5
+                            siou_losses.append(siou_loss)
+                            
+                            # Objectness loss with soft target based on IoU, with 1.5 weight
+                            soft_target = torch.clamp(best_iou, min=0.3, max=0.8)
+                            obj_loss = self.binary_focal_loss(pred_conf, soft_target.unsqueeze(0), device) * 1.5
+                            obj_losses.append(obj_loss)
+                            
+                            # Classification loss with 1.5 weight
+                            target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
+                            cls_loss = self.multi_focal_loss(pred_class, target_class, device) * 1.5
+                            cls_losses.append(cls_loss)
+                            
+                            # Mark this prediction as assigned
+                            matched_preds.add(best_pred_idx)
+                        else:
+                            # If no prediction available, add penalty
+                            missed_penalty = torch.tensor(2.0, device=device, requires_grad=True)
+                            obj_losses.append(missed_penalty)
+                    else:
+                        # No unused predictions available, add penalty
+                        missed_penalty = torch.tensor(2.0, device=device, requires_grad=True)
+                        obj_losses.append(missed_penalty)
+
+            # Process negative predictions (unmatched predictions in this grid)
+            # Only process predictions that were not matched AND not assigned in Option 2
+            for pred_idx, pred in enumerate(grid_preds):
+                if pred_idx not in matched_preds:
+                    pred_conf = pred['conf'].unsqueeze(0).to(device)
+                    neg_target = torch.zeros_like(pred_conf, device=device)
+                    obj_loss = self.binary_focal_loss(pred_conf, neg_target, device)
+                    obj_losses.append(obj_loss)
         
-        for i, pred in enumerate(pred_data):
-            for j, gt in enumerate(gt_data):
+        return {
+            "siou": siou_losses,
+            "objectness": obj_losses,
+            "classification": cls_losses
+        }
+
+    def _match_predictions_to_gts_in_grid(self, grid_preds, grid_gts, device):
+        """
+        Match predictions to ground truths within a single grid cell using IoU.
+        Returns list of (pred_idx, gt_idx, iou_value) tuples for matches above threshold.
+        """
+        matches = []
+        iou_threshold = 0.5  # Higher threshold since we're in the same grid cell
+        
+        if len(grid_preds) == 0 or len(grid_gts) == 0:
+            return matches
+        
+        # Compute IoU matrix for this grid cell
+        iou_matrix = torch.zeros(len(grid_preds), len(grid_gts), device=device)
+        for i, pred in enumerate(grid_preds):
+            for j, gt in enumerate(grid_gts):
                 pred_bbox = pred['bbox'].to(device)
                 gt_bbox = self._ensure_tensor(gt['bbox'], device)
                 iou_matrix[i, j] = self._bbox_iou_differentiable(pred_bbox, gt_bbox)
         
-        return iou_matrix
+        # Greedy matching: assign each GT to best prediction above threshold
+        used_preds = set()
+        for gt_idx in range(len(grid_gts)):
+            best_iou = torch.tensor(0.0, device=device)
+            best_pred_idx = -1
+            
+            for pred_idx in range(len(grid_preds)):
+                if pred_idx not in used_preds:
+                    iou_val = iou_matrix[pred_idx, gt_idx]
+                    if iou_val > best_iou and iou_val > iou_threshold:
+                        best_iou = iou_val
+                        best_pred_idx = pred_idx
+            
+            if best_pred_idx >= 0:
+                matches.append((best_pred_idx, gt_idx, best_iou))
+                used_preds.add(best_pred_idx)
+        
+        return matches
+
+
 
     def _bbox_iou_differentiable(self, box1, box2):
         """
@@ -352,7 +458,6 @@ class ObjectDetectionLoss(nn.Module):
     def _ensure_tensor(self, data, device, dtype=torch.float32):
         """
         Ensure data is a tensor on the correct device with correct dtype.
-        Maintains gradient tracking if input is already a tensor with gradients.
         """
         if isinstance(data, torch.Tensor):
             return data.to(device=device, dtype=dtype)
