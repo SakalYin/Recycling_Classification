@@ -1,317 +1,408 @@
+# from torchvision.ops import complete_box_iou_loss, sigmoid_focal_loss
+# import torch
+# import torch.nn as nn
+# from munkres import Munkres
+# import numpy as np
+
+# class ObjectDetectionLoss(nn.Module):
+#     def __init__(self, processor, classes_alpha=None, eps=1e-7):
+#         super(ObjectDetectionLoss, self).__init__()
+#         self.processor = processor
+#         self.matching_algorithm = Munkres()
+#         self.classes_alpha = classes_alpha
+    
+#     def forward(self, outputs, targets):
+#         """
+#         outputs: Tensor [B, N, 5 + C], N = number of predictions per image (all predictions concatenated, no grid)
+#         targets: Tensor [B, M, 5 + C], M = number of GT boxes per image
+#         Each bbox format assumed to be [xc, yc, w, h]
+#         """
+#         batch_size = outputs.shape[0]
+#         device = outputs.device
+        
+#         total_siou = torch.zeros(1, device=device)
+#         total_obj = torch.zeros(1, device=device)
+#         total_cls = torch.zeros(1, device=device)
+
+#         for i in range(batch_size):
+#             pred_data = self.processor.convert_yolo_output_to_bboxes(outputs[i], grid=False, class_tensor=True, conf_threshold=None)
+#             gt_data = self.processor.convert_yolo_output_to_bboxes(targets[i], grid=False, class_tensor=True, conf_threshold=0.5)
+            
+#             loss_dict = self._compute_single_image_loss_global(pred_data, gt_data, device)
+#             total_siou += loss_dict["siou"]
+#             total_obj += loss_dict["objectness"]
+#             total_cls += loss_dict["classification"]
+        
+#         batch_size_tensor = torch.tensor(batch_size, device=device, dtype=torch.float32)
+#         total_loss = (total_siou + total_obj + total_cls) / batch_size_tensor
+#         return {
+#             "total": total_loss.squeeze(),
+#             "siou": total_siou / batch_size_tensor,
+#             "objectness": total_obj / batch_size_tensor,
+#             "classification": total_cls / batch_size_tensor,
+#         }
+    
+#     def repeat_for_cartesian(self, pred_list, gt_list, device):
+#         """
+#         Given two lists of equal-length tensors (e.g., [x, y, w, h] or class logits),
+#         create a Cartesian product repeat without breaking gradients.
+
+#         Returns:
+#             pred_repeat: [P*G, D] tensor (each pred repeated G times)
+#             gt_repeat:   [P*G, D] tensor (GTs repeated P times)
+#         """
+#         if len(pred_list) == 0 or len(gt_list) == 0:
+#             return torch.empty(0), torch.empty(0)
+
+#         # Stack into tensors
+#         pred_t = torch.stack(pred_list)  # [P, D]
+#         gt_t   = torch.stack(gt_list)    # [G, D]
+
+#         P, D = pred_t.size()
+#         G = gt_t.size(0)
+
+#         # Repeat for Cartesian pairing
+#         pred_repeat = pred_t.unsqueeze(1).expand(P, G, D).reshape(-1, D)
+#         gt_repeat   = gt_t.unsqueeze(0).expand(P, G, D).reshape(-1, D)
+
+#         return pred_repeat, gt_repeat
+    
+#     def _compute_single_image_loss_global(self, pred_data, gt_data, device):
+#         """
+#         Match predictions to ground truths globally (not grid-based).
+#         pred_data and gt_data are lists of dicts with keys:
+#             'bbox': tensor of shape [4]
+#             'conf': tensor scalar
+#             'class_tensor': tensor of shape [num_classes]
+#             'class_id': int
+#         """
+#         ciou_losses = []
+#         obj_losses = []
+#         cls_losses = []
+#         P, G = None, None
+        
+#         if len(gt_data) == 0:
+#             # print('No Groud Truths')
+#             # No GTs: all predictions should be negative (objectness=0)
+#             for pred in pred_data:
+#                 pred_conf = pred['conf']
+#                 obj_losses.append(sigmoid_focal_loss(pred_conf, torch.zeros_like(pred_conf, device=device))*torch.tensor(1.5, device=device))
+        
+#         else:
+#             # Compute CIoU + Classification Cost matrix between all preds and GTs
+#             pred_bbox = [pred['bbox'] for pred in pred_data]
+#             gt_bbox = [gt['bbox'] for gt in gt_data]
+#             pred_class = [pred['class_tensor'] for pred in pred_data]
+#             gt_class = [gt['class_tensor'] for gt in gt_data]
+#             pred_conf = [pred['conf'] for pred in pred_data]
+#             gt_conf = [gt['conf'] for gt in gt_data]
+
+#             P = len(pred_bbox)
+#             G = len(gt_bbox)
+
+#             pred_bbox_repeat, gt_bbox_repeat = self.repeat_for_cartesian(pred_bbox, gt_bbox, device=device)
+#             pred_class_repeat, gt_class_repeat = self.repeat_for_cartesian(pred_class, gt_class, device=device)
+
+#             CIoU_matrix = complete_box_iou_loss(pred_bbox_repeat, gt_bbox_repeat).view(P, G)
+#             Cls_matrix = sigmoid_focal_loss(pred_class_repeat, gt_class_repeat).mean(dim=1).view(P, G)
+#             cost_matrix = CIoU_matrix + Cls_matrix
+#             cost_matrix = cost_matrix.clone().detach().cpu().numpy().tolist()
+            
+#             matches = self.matching_algorithm.compute(cost_matrix)
+#             used_pred_idx, used_gt_idx = [], []
+
+#             for pred_idx, gt_idx in matches:
+#                 if pred_idx >= P or gt_idx >= G:
+#                     print(f"Invalid match: pred_idx={pred_idx}, gt_idx={gt_idx}, P={P}, G={G}")
+#                     continue
+#                 ciou_losses.append(complete_box_iou_loss(pred_bbox[pred_idx], gt_bbox[gt_idx].to(device)))
+#                 cls_losses.append(sigmoid_focal_loss(pred_class[pred_idx], gt_class[gt_idx].to(device)).mean())
+#                 obj_losses.append(sigmoid_focal_loss(pred_conf[pred_idx], gt_conf[gt_idx].to(device)))
+#                 used_pred_idx.append(pred_idx)
+#                 used_gt_idx.append(gt_idx)
+            
+#             # Process unmatched predictions
+#             unmatched_pred = [idx for idx in np.arange(P) if idx not in used_pred_idx]
+#             if len(unmatched_pred) > 0:
+#                 for i in unmatched_pred:
+#                     obj_losses.append(sigmoid_focal_loss(pred_conf[i], torch.zeros_like(pred_conf[i], device=device))*torch.tensor(1.5, device=device))
+
+#         total_siou_loss = sum(ciou_losses) if len(ciou_losses) > 0 and G else torch.tensor(0.0, device=device, requires_grad=True)
+#         total_obj_loss = sum(obj_losses) if len(obj_losses) > 0 else torch.tensor(0.0, device=device, requires_grad=True)
+#         total_cls_loss = sum(cls_losses) if len(cls_losses) > 0 and G else torch.tensor(0.0, device=device, requires_grad=True)
+
+#         total_obj_loss = total_obj_loss / torch.tensor(float(len(pred_data)), device=device) 
+#         total_siou_loss = total_siou_loss / torch.tensor(float(len(used_pred_idx)), device=device) if G else torch.tensor(0.0, device=device, requires_grad=True)
+#         total_cls_loss = total_cls_loss / torch.tensor(float(len(used_pred_idx)), device=device) if G else torch.tensor(0.0, device=device, requires_grad=True)
+
+#         return {
+#             "total": total_siou_loss + total_obj_loss + total_cls_loss,
+#             "siou": total_siou_loss,
+#             "objectness": total_obj_loss,
+#             "classification": total_cls_loss,
+#         }
+
+#     def _bbox_iou_differentiable(self, box1, box2):
+#         box1_xyxy = self._xywh_to_xyxy_differentiable(box1)
+#         box2_xyxy = self._xywh_to_xyxy_differentiable(box2)
+
+#         x1 = torch.max(box1_xyxy[0], box2_xyxy[0])
+#         y1 = torch.max(box1_xyxy[1], box2_xyxy[1])
+#         x2 = torch.min(box1_xyxy[2], box2_xyxy[2])
+#         y2 = torch.min(box1_xyxy[3], box2_xyxy[3])
+
+#         inter = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+#         area1 = (box1_xyxy[2] - box1_xyxy[0]) * (box1_xyxy[3] - box1_xyxy[1])
+#         area2 = (box2_xyxy[2] - box2_xyxy[0]) * (box2_xyxy[3] - box2_xyxy[1])
+#         union = area1 + area2 - inter + self.eps
+#         return inter / union
+
+#     def _xywh_to_xyxy_differentiable(self, box):
+#         xc, yc, w, h = box[0], box[1], box[2], box[3]
+#         return torch.stack([
+#             xc - w / 2,
+#             yc - h / 2,
+#             xc + w / 2,
+#             yc + h / 2
+#         ])
+
+#     def _ensure_tensor(self, data, device, dtype=torch.float32):
+#         if isinstance(data, torch.Tensor):
+#             return data.to(device=device, dtype=dtype)
+#         else:
+#             return torch.tensor(data, device=device, dtype=dtype)
+
+from torchvision.ops import complete_box_iou_loss, sigmoid_focal_loss
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from munkres import Munkres
 import numpy as np
 
-class SIoU(nn.Module):
-    def __init__(self, x1y1x2y2=True, eps=1e-7):
-        super(SIoU, self).__init__()
-        self.x1y1x2y2 = x1y1x2y2
-        self.eps = eps
-  
-    def forward(self, box1, box2):
-        if self.x1y1x2y2:  
-            b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
-            b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
-        else:  
-            b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
-            b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
-            b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
-            b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
-
-        inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-                (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
-    
-        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + self.eps
-        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + self.eps
-        union = w1 * h1 + w2 * h2 - inter + self.eps
-    
-        iou = inter / union
-        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
-        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
-        s_cw = (b2_x1 + b2_x2 - b1_x1 - b1_x2) * 0.5
-        s_ch = (b2_y1 + b2_y2 - b1_y1 - b1_y2) * 0.5
-        sigma = torch.pow(s_cw ** 2 + s_ch ** 2, 0.5) + self.eps
-        sin_alpha_1 = torch.abs(s_cw) / sigma
-        sin_alpha_2 = torch.abs(s_ch) / sigma
-        threshold = pow(2, 0.5) / 2
-        sin_alpha = torch.where(sin_alpha_1 > threshold, sin_alpha_2, sin_alpha_1)
-            
-        angle_cost = 1 - 2 * torch.pow(torch.sin(torch.arcsin(sin_alpha) - np.pi/4), 2)
-            
-        rho_x = (s_cw / (cw + self.eps)) ** 2
-        rho_y = (s_ch / (ch + self.eps)) ** 2
-        gamma = 2 - angle_cost
-        distance_cost = 2 - torch.exp(gamma * rho_x) - torch.exp(gamma * rho_y)
-            
-        omiga_w = torch.abs(w1 - w2) / torch.max(w1, w2)
-        omiga_h = torch.abs(h1 - h2) / torch.max(h1, h2)
-        shape_cost = torch.pow(1 - torch.exp(-1 * omiga_w), 4) + torch.pow(1 - torch.exp(-1 * omiga_h), 4)
-        
-        return 1 - (iou + 0.5 * (distance_cost + shape_cost))
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2, num_classes=None):
-        super(FocalLoss, self).__init__()
-        self.gamma = gamma
-        self.num_classes = num_classes
-        
-        if num_classes is None:
-            self.alpha_value = alpha
-        else:
-            if alpha is None:
-                self.alpha_value = None
-            elif isinstance(alpha, (list, tuple)):
-                if len(alpha) != num_classes:
-                    raise ValueError(f"Alpha list length ({len(alpha)}) must match num_classes ({num_classes})")
-                self.alpha_value = alpha
-            else:
-                raise ValueError("For multi-class, alpha must be None or a list of per-class weights")
-    
-    def forward(self, inputs, targets, device=None):
-        if device is None:
-            device = inputs.device
-            
-        if self.num_classes is None:
-            return self._binary_focal_loss(inputs, targets, device)
-        else:
-            return self._multiclass_focal_loss(inputs, targets, device)
-    
-    def _binary_focal_loss(self, inputs, targets, device):
-        targets = targets.float()
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        p = torch.sigmoid(inputs)
-        pt = p * targets + (1 - p) * (1 - targets)
-        focal_term = (1 - pt) ** self.gamma
-        loss = focal_term * bce_loss
-        
-        if self.alpha_value is not None:
-            alpha = torch.tensor(self.alpha_value, device=device, dtype=torch.float32)
-            alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-            loss = alpha_t * loss
-        
-        return loss.mean()
-    
-    def _multiclass_focal_loss(self, inputs, targets, device):
-        if targets.dim() != 1:
-            targets = torch.argmax(targets, dim=1)
-        if inputs.dim() == 1:
-            inputs = inputs.unsqueeze(0)
-
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        probs = F.softmax(inputs, dim=1)
-        pt = probs[torch.arange(len(probs)), targets]
-        focal_term = (1 - pt) ** self.gamma
-        loss = focal_term * ce_loss
-
-        if self.alpha_value is not None:
-            alpha = torch.tensor(self.alpha_value, device=device, dtype=torch.float32)
-            alpha_t = alpha[targets]
-            loss = alpha_t * loss
-
-        return loss.mean()
-
-
 class ObjectDetectionLoss(nn.Module):
-    def __init__(self, processor, classes_alpha, eps=1e-7):
+    def __init__(self, processor, classes_alpha=None, eps=1e-7, obj_loss_weight=2.0, 
+                 cls_loss_weight=2.0, bbox_loss_weight=2.0, neg_obj_weight=1.0):
         super(ObjectDetectionLoss, self).__init__()
         self.processor = processor
+        self.matching_algorithm = Munkres()
+        self.classes_alpha = classes_alpha
         self.eps = eps
-        self.siou_loss = SIoU(x1y1x2y2=False)
-        self.binary_focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
-        self.multi_focal_loss = FocalLoss(alpha=classes_alpha, gamma=2.0, num_classes=processor.num_classes)
+        self.obj_loss_weight = obj_loss_weight
+        self.cls_loss_weight = cls_loss_weight
+        self.bbox_loss_weight = bbox_loss_weight
+        self.neg_obj_weight = neg_obj_weight  # Weight for negative objectness loss
     
     def forward(self, outputs, targets):
         """
-        outputs: Tensor [B, N, 5 + C], N = number of predictions per image (all predictions concatenated, no grid)
+        outputs: Tensor [B, N, 5 + C], N = number of predictions per image
         targets: Tensor [B, M, 5 + C], M = number of GT boxes per image
-        Each bbox format assumed to be [xc, yc, w, h]
         """
         batch_size = outputs.shape[0]
         device = outputs.device
         
-        total_siou = torch.zeros(1, device=device, requires_grad=True)
-        total_obj = torch.zeros(1, device=device, requires_grad=True)
-        total_cls = torch.zeros(1, device=device, requires_grad=True)
+        total_siou = 0.0
+        total_obj = 0.0
+        total_cls = 0.0
+        valid_samples = 0
 
         for i in range(batch_size):
-            pred_data = self.processor.convert_output_to_bboxes(outputs[i], grid=False, class_tensor=True)
-            gt_data = self.processor.convert_output_to_bboxes(targets[i], grid=False, class_tensor=True)
-            
-            loss_dict = self._compute_single_image_loss_global(pred_data, gt_data, device)
-            
-            total_siou += loss_dict["siou"]
-            total_obj += loss_dict["objectness"]
-            total_cls += loss_dict["classification"]
+            try:
+                pred_data = self.processor.convert_yolo_output_to_bboxes(
+                    outputs[i], grid=False, class_tensor=True, conf_threshold=None
+                )
+                gt_data = self.processor.convert_yolo_output_to_bboxes(
+                    targets[i], grid=False, class_tensor=True, conf_threshold=0.5
+                )
+                
+                loss_dict = self._compute_single_image_loss_global(pred_data, gt_data, device)
+                total_siou += loss_dict["siou"]
+                total_obj += loss_dict["objectness"]
+                total_cls += loss_dict["classification"]
+                valid_samples += 1
+                
+            except Exception as e:
+                print(f"Error processing batch item {i}: {e}")
+                continue
         
-        batch_size_tensor = torch.tensor(batch_size, device=device, dtype=torch.float32)
-        total_loss = (total_siou + total_obj + total_cls) / batch_size_tensor
-        return total_loss.squeeze()
-    
-    def _compute_single_image_loss_global(self, pred_data, gt_data, device):
-        """
-        Match predictions to ground truths globally (not grid-based).
-        pred_data and gt_data are lists of dicts with keys:
-            'bbox': tensor of shape [4]
-            'conf': tensor scalar
-            'class_tensor': tensor of shape [num_classes]
-            'class_id': int
-        """
-        siou_losses = []
-        obj_losses = []
-        cls_losses = []
-        
-        if len(gt_data) == 0:
-            # No GTs: all predictions should be negative (objectness=0)
-            for pred in pred_data:
-                pred_conf = pred['conf'].unsqueeze(0)
-                neg_target = torch.zeros_like(pred_conf, device=device)
-                obj_loss = self.binary_focal_loss(pred_conf, neg_target, device=device)
-                obj_losses.append(obj_loss)
+        if valid_samples == 0:
+            # Return zero losses if no valid samples
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
             return {
-                "siou": siou_losses,
-                "objectness": obj_losses,
-                "classification": cls_losses
+                "total": zero_loss,
+                "siou": zero_loss,
+                "objectness": zero_loss,
+                "classification": zero_loss,
             }
         
-        # Compute IoU matrix between all preds and GTs
-        iou_matrix = torch.zeros(len(pred_data), len(gt_data), device=device)
-        for i, pred in enumerate(pred_data):
-            pred_bbox = pred['bbox'].to(device)
-            for j, gt in enumerate(gt_data):
-                gt_bbox = self._ensure_tensor(gt['bbox'], device)
-                iou_matrix[i, j] = self._bbox_iou_differentiable(pred_bbox, gt_bbox)
+        # Average over valid samples
+        avg_siou = total_siou / valid_samples
+        avg_obj = total_obj / valid_samples  
+        avg_cls = total_cls / valid_samples
         
-        # Match predictions to GTs greedily (max IoU) with threshold
-        matches = []
-        used_preds = set()
-        used_gts = set()
-        iou_threshold = 0.2
-        
-        for _ in range(min(len(pred_data), len(gt_data))):
-            max_iou = 0
-            max_pred_idx = -1
-            max_gt_idx = -1
-            for pred_idx in range(len(pred_data)):
-                if pred_idx in used_preds:
-                    continue
-                for gt_idx in range(len(gt_data)):
-                    if gt_idx in used_gts:
-                        continue
-                    iou_val = iou_matrix[pred_idx, gt_idx]
-                    if iou_val > max_iou:
-                        max_iou = iou_val
-                        max_pred_idx = pred_idx
-                        max_gt_idx = gt_idx
-            if max_iou >= iou_threshold:
-                matches.append((max_pred_idx, max_gt_idx, max_iou))
-                used_preds.add(max_pred_idx)
-                used_gts.add(max_gt_idx)
-            else:
-                break
-        
-        # Process matched pairs
-        for pred_idx, gt_idx, iou_val in matches:
-            pred = pred_data[pred_idx]
-            gt = gt_data[gt_idx]
-            
-            pred_bbox = pred['bbox'].to(device)
-            gt_bbox = self._ensure_tensor(gt['bbox'], device)
-            pred_conf = pred['conf'].unsqueeze(0).to(device)
-            pred_class = pred['class_tensor'].to(device)
-            
-            siou_losses.append(self.siou_loss(pred_bbox, gt_bbox))
-            obj_losses.append(self.binary_focal_loss(pred_conf, torch.ones_like(pred_conf, device=device), device))
-            target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
-            cls_losses.append(self.multi_focal_loss(pred_class, target_class, device))
-        
-        # Process unmatched GTs (missed detections)
-        unmatched_gts = [i for i in range(len(gt_data)) if i not in used_gts]
-        unused_preds = [i for i in range(len(pred_data)) if i not in used_preds]
-        for gt_idx in unmatched_gts:
-            gt = gt_data[gt_idx]
-            
-            # Assign best unused prediction by IoU if available
-            best_pred_idx = None
-            best_iou = torch.tensor(0.0, device=device)
-            for pred_idx in unused_preds:
-                pred_bbox = pred_data[pred_idx]['bbox'].to(device)
-                gt_bbox = self._ensure_tensor(gt['bbox'], device)
-                iou_val = self._bbox_iou_differentiable(pred_bbox, gt_bbox)
-                if iou_val > best_iou:
-                    best_iou = iou_val
-                    best_pred_idx = pred_idx
-            
-            if best_pred_idx is not None:
-                best_pred = pred_data[best_pred_idx]
-                pred_bbox = best_pred['bbox'].to(device)
-                gt_bbox = self._ensure_tensor(gt['bbox'], device)
-                pred_conf = best_pred['conf'].unsqueeze(0).to(device)
-                pred_class = best_pred['class_tensor'].to(device)
-                
-                siou_losses.append(self.siou_loss(pred_bbox, gt_bbox))
-                soft_target = torch.clamp(best_iou, min=0.3, max=0.8)
-                obj_losses.append(self.binary_focal_loss(pred_conf, soft_target.unsqueeze(0), device))
-                target_class = self._ensure_tensor([gt['class_id']], device, dtype=torch.long)
-                cls_losses.append(self.multi_focal_loss(pred_class, target_class, device))
-                
-                used_preds.add(best_pred_idx)
-                unused_preds.remove(best_pred_idx)
-            else:
-                # No prediction available - penalty
-                obj_losses.append(torch.tensor(2.0, device=device, requires_grad=True))
-        
-        # Process unmatched predictions (negatives)
-        for pred_idx in range(len(pred_data)):
-            if pred_idx not in used_preds:
-                pred_conf = pred_data[pred_idx]['conf'].unsqueeze(0).to(device)
-                obj_losses.append(self.binary_focal_loss(pred_conf, torch.zeros_like(pred_conf, device=device), device))
-        
-        total_siou_loss = sum(siou_losses) if siou_losses else torch.tensor(0.0, device=device, requires_grad=True)
-        total_obj_loss = sum(obj_losses) if obj_losses else torch.tensor(0.0, device=device, requires_grad=True)
-        total_cls_loss = sum(cls_losses) if cls_losses else torch.tensor(0.0, device=device, requires_grad=True)
-        
-        num_positive = len(siou_losses)
-        if num_positive > 0:
-            num_pos_tensor = torch.tensor(float(num_positive), device=device)
-            total_siou_loss = total_siou_loss / num_pos_tensor
-            total_cls_loss = total_cls_loss / num_pos_tensor
+        # Apply loss weights
+        weighted_total = (
+            self.bbox_loss_weight * avg_siou + 
+            self.obj_loss_weight * avg_obj + 
+            self.cls_loss_weight * avg_cls
+        )
         
         return {
-            "total": total_siou_loss + total_obj_loss + total_cls_loss,
-            "siou": total_siou_loss,
-            "objectness": total_obj_loss,
-            "classification": total_cls_loss,
-            "num_positive": num_positive
+            "total": weighted_total,
+            "siou": avg_siou,
+            "objectness": avg_obj,
+            "classification": avg_cls,
         }
+    
+    def repeat_for_cartesian(self, pred_list, gt_list, device):
+        """Create Cartesian product repeat without breaking gradients."""
+        if len(pred_list) == 0 or len(gt_list) == 0:
+            return torch.empty((0, pred_list[0].shape[0]) if pred_list else (0, 0), device=device), \
+                   torch.empty((0, gt_list[0].shape[0]) if gt_list else (0, 0), device=device)
 
-    def _bbox_iou_differentiable(self, box1, box2):
-        box1_xyxy = self._xywh_to_xyxy_differentiable(box1)
-        box2_xyxy = self._xywh_to_xyxy_differentiable(box2)
+        pred_t = torch.stack(pred_list)  # [P, D]
+        gt_t = torch.stack(gt_list)      # [G, D]
 
-        x1 = torch.max(box1_xyxy[0], box2_xyxy[0])
-        y1 = torch.max(box1_xyxy[1], box2_xyxy[1])
-        x2 = torch.min(box1_xyxy[2], box2_xyxy[2])
-        y2 = torch.min(box1_xyxy[3], box2_xyxy[3])
+        P, D = pred_t.size()
+        G = gt_t.size(0)
 
-        inter = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
-        area1 = (box1_xyxy[2] - box1_xyxy[0]) * (box1_xyxy[3] - box1_xyxy[1])
-        area2 = (box2_xyxy[2] - box2_xyxy[0]) * (box2_xyxy[3] - box2_xyxy[1])
-        union = area1 + area2 - inter + self.eps
-        return inter / union
+        pred_repeat = pred_t.unsqueeze(1).expand(P, G, D).reshape(-1, D)
+        gt_repeat = gt_t.unsqueeze(0).expand(P, G, D).reshape(-1, D)
 
-    def _xywh_to_xyxy_differentiable(self, box):
-        xc, yc, w, h = box[0], box[1], box[2], box[3]
-        return torch.stack([
-            xc - w / 2,
-            yc - h / 2,
-            xc + w / 2,
-            yc + h / 2
-        ])
-
-    def _ensure_tensor(self, data, device, dtype=torch.float32):
-        if isinstance(data, torch.Tensor):
-            return data.to(device=device, dtype=dtype)
-        else:
-            return torch.tensor(data, device=device, dtype=dtype)
+        return pred_repeat, gt_repeat
+    
+    def _compute_single_image_loss_global(self, pred_data, gt_data, device):
+        """Match predictions to ground truths globally."""
+        
+        # Initialize losses as tensors
+        siou_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        obj_loss = torch.tensor(0.0, device=device, requires_grad=True) 
+        cls_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        num_preds = len(pred_data)
+        num_gts = len(gt_data)
+        
+        if num_preds == 0:
+            return {"siou": siou_loss, "objectness": obj_loss, "classification": cls_loss}
+        
+        if num_gts == 0:
+            # No ground truths: all predictions should have objectness = 0
+            negative_obj_losses = []
+            for pred in pred_data:
+                pred_conf = pred['conf']
+                target_conf = torch.zeros_like(pred_conf)
+                neg_loss = sigmoid_focal_loss(
+                    pred_conf.unsqueeze(0), target_conf.unsqueeze(0), 
+                    reduction='mean'
+                )
+                negative_obj_losses.append(neg_loss)
+            
+            if negative_obj_losses:
+                obj_loss = torch.stack(negative_obj_losses).mean() * self.neg_obj_weight
+            
+            return {"siou": siou_loss, "objectness": obj_loss, "classification": cls_loss}
+        
+        # Extract data for matching
+        pred_bbox = [pred['bbox'] for pred in pred_data]
+        gt_bbox = [gt['bbox'] for gt in gt_data]
+        pred_class = [pred['class_tensor'] for pred in pred_data]
+        gt_class = [gt['class_tensor'] for gt in gt_data]
+        pred_conf = [pred['conf'] for pred in pred_data]
+        
+        # Create ground truth confidence (should be 1.0 for positive samples)
+        gt_conf = [torch.ones_like(pred_conf[0]) for _ in range(num_gts)]
+        
+        # Compute cost matrix
+        try:
+            pred_bbox_repeat, gt_bbox_repeat = self.repeat_for_cartesian(pred_bbox, gt_bbox, device)
+            pred_class_repeat, gt_class_repeat = self.repeat_for_cartesian(pred_class, gt_class, device)
+            
+            # Ensure proper format for complete_box_iou_loss (needs [N, 4] tensors)
+            if pred_bbox_repeat.numel() > 0 and gt_bbox_repeat.numel() > 0:
+                # Convert to xyxy format if needed
+                pred_xyxy = self._convert_to_xyxy(pred_bbox_repeat)
+                gt_xyxy = self._convert_to_xyxy(gt_bbox_repeat)
+                
+                ciou_matrix = complete_box_iou_loss(pred_xyxy, gt_xyxy, reduction='none').view(num_preds, num_gts)
+                cls_matrix = sigmoid_focal_loss(pred_class_repeat, gt_class_repeat, reduction='none').mean(dim=1).view(num_preds, num_gts)
+                
+                cost_matrix = (ciou_matrix + cls_matrix).detach().cpu().numpy()
+                
+                # Hungarian matching
+                matches = self.matching_algorithm.compute(cost_matrix.tolist())
+                
+                # Compute losses for matched pairs
+                matched_pred_idx = []
+                matched_gt_idx = []
+                
+                ciou_losses = []
+                cls_losses = []
+                obj_losses = []
+                
+                for pred_idx, gt_idx in matches:
+                    if pred_idx < num_preds and gt_idx < num_gts:
+                        # CIOU loss
+                        pred_box_xyxy = self._convert_to_xyxy(pred_bbox[pred_idx].unsqueeze(0))
+                        gt_box_xyxy = self._convert_to_xyxy(gt_bbox[gt_idx].unsqueeze(0))
+                        ciou = complete_box_iou_loss(pred_box_xyxy, gt_box_xyxy, reduction='mean')
+                        ciou_losses.append(ciou)
+                        
+                        # Classification loss
+                        cls = sigmoid_focal_loss(
+                            pred_class[pred_idx].unsqueeze(0), 
+                            gt_class[gt_idx].unsqueeze(0), 
+                            reduction='mean'
+                        )
+                        cls_losses.append(cls)
+                        
+                        # Objectness loss (positive)
+                        obj = sigmoid_focal_loss(
+                            pred_conf[pred_idx].unsqueeze(0), 
+                            gt_conf[gt_idx].unsqueeze(0), 
+                            reduction='mean'
+                        )
+                        obj_losses.append(obj)
+                        
+                        matched_pred_idx.append(pred_idx)
+                        matched_gt_idx.append(gt_idx)
+                
+                # Compute losses for unmatched predictions (negative objectness)
+                unmatched_pred_idx = [i for i in range(num_preds) if i not in matched_pred_idx]
+                for pred_idx in unmatched_pred_idx:
+                    target_conf = torch.zeros_like(pred_conf[pred_idx])
+                    neg_obj = sigmoid_focal_loss(
+                        pred_conf[pred_idx].unsqueeze(0), 
+                        target_conf.unsqueeze(0), 
+                        reduction='mean'
+                    ) * self.neg_obj_weight
+                    obj_losses.append(neg_obj)
+                
+                # Aggregate losses
+                if ciou_losses:
+                    siou_loss = torch.stack(ciou_losses).mean()
+                if cls_losses:
+                    cls_loss = torch.stack(cls_losses).mean()
+                if obj_losses:
+                    obj_loss = torch.stack(obj_losses).mean()
+                    
+        except Exception as e:
+            print(f"Error in loss computation: {e}")
+            # Return zero losses on error
+            pass
+        
+        return {
+            "siou": siou_loss,
+            "objectness": obj_loss, 
+            "classification": cls_loss,
+        }
+    
+    def _convert_to_xyxy(self, xywh_boxes):
+        """Convert from [xc, yc, w, h] to [x1, y1, x2, y2] format."""
+        if xywh_boxes.numel() == 0:
+            return xywh_boxes
+            
+        xc, yc, w, h = xywh_boxes[..., 0], xywh_boxes[..., 1], xywh_boxes[..., 2], xywh_boxes[..., 3]
+        x1 = xc - w / 2
+        y1 = yc - h / 2  
+        x2 = xc + w / 2
+        y2 = yc + h / 2
+        
+        return torch.stack([x1, y1, x2, y2], dim=-1)

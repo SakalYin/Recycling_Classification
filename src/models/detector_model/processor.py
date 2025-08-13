@@ -346,7 +346,7 @@ class TrainingProcessor:
         Returns:
             List[Dict]: Each dict has keys: 'bbox', 'conf', 'class_id', optionally 'class_tensor' adn 'grid'
         """
-        conf_threshold = conf_threshold if conf_threshold is not None else 0.5
+        conf_threshold = conf_threshold
         input_size = input_size if input_size is not None else self.input_size
         num_classes = num_classes if num_classes is not None else self.num_classes
         num_anchors = num_anchors if num_anchors is not None else self.num_anchors
@@ -367,8 +367,9 @@ class TrainingProcessor:
                     th = anchor_data[3]
                     conf = anchor_data[4]
 
-                    if (not is_training and conf.item() < conf_threshold) or (is_training and conf < conf_threshold):
-                        continue
+                    if conf_threshold is not None:
+                        if conf.item() < conf_threshold:
+                            continue
                     
                     class_base = (num_anchors * 5) + anchor * num_classes
                     class_probs = output_tensor[i, j, class_base: class_base + num_classes]
