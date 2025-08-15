@@ -6,7 +6,7 @@ import numpy as np
 
 class ObjectDetectionLoss(nn.Module):
     def __init__(self, processor, alpha=None, eps=1e-7, obj_loss_weight=1.5, 
-                 cls_loss_weight=1.5, bbox_loss_weight=0.5, neg_obj_weight=0.5, pos_obj_weight=1.0):
+                 cls_loss_weight=1.5, bbox_loss_weight=0.5, neg_obj_weight=0.5, pos_obj_weight=1.5):
         super(ObjectDetectionLoss, self).__init__()
         self.processor = processor
         self.matching_algorithm = Munkres()
@@ -26,7 +26,7 @@ class ObjectDetectionLoss(nn.Module):
         batch_size = outputs.shape[0]
         device = outputs.device
         
-        total_siou = 0.0
+        total_ciou = 0.0
         total_obj = 0.0
         total_cls = 0.0
         total_positive_obj_loss = []
@@ -35,20 +35,20 @@ class ObjectDetectionLoss(nn.Module):
         for i in range(batch_size):
             try:
                 pred_data = self.processor.convert_output_to_bboxes(
-                    outputs[i], grid=False, class_tensor=True, conf_threshold=None
+                    outputs[i], grid=True, class_tensor=True, conf_threshold=None
                 )
                 gt_data = self.processor.convert_output_to_bboxes(
-                    targets[i], grid=False, class_tensor=True, conf_threshold=0.5
+                    targets[i], grid=True, class_tensor=True, conf_threshold=0.5
                 )
                 
-                loss_dict = self._compute_single_image_loss_global(pred_data, gt_data, device)
-                total_siou += loss_dict["siou"]
+                loss_dict = self._compute_single_image_loss(pred_data, gt_data, device)
+                total_ciou += loss_dict["ciou"]
                 total_obj += loss_dict["objectness"]
                 total_cls += loss_dict["classification"]
-                try:
+                
+                # Safe append for positive objectness loss
+                if "positive_objectness" in loss_dict and loss_dict["positive_objectness"] is not None:
                     total_positive_obj_loss.append(loss_dict['positive_objectness'])
-                except:
-                    pass
 
                 valid_samples += 1
                 
@@ -61,30 +61,36 @@ class ObjectDetectionLoss(nn.Module):
             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
             return {
                 "total": zero_loss,
-                "siou": zero_loss,
+                "ciou": zero_loss,
                 "objectness": zero_loss,
                 "classification": zero_loss,
                 "positive_objectness": zero_loss
             }
         
         # Average over valid samples
-        avg_siou = total_siou / valid_samples
+        avg_ciou = total_ciou / valid_samples
         avg_obj = total_obj / valid_samples  
         avg_cls = total_cls / valid_samples
         
+        # Handle positive objectness loss safely
+        if total_positive_obj_loss:
+            avg_pos_obj = torch.stack(total_positive_obj_loss).mean()
+        else:
+            avg_pos_obj = torch.tensor(0.0, device=device, requires_grad=True)
+        
         # Apply loss weights
         weighted_total = (
-            self.bbox_loss_weight * avg_siou + 
+            self.bbox_loss_weight * avg_ciou + 
             self.obj_loss_weight * avg_obj + 
             self.cls_loss_weight * avg_cls
         )
         
         return {
             "total": weighted_total,
-            "siou": avg_siou * self.bbox_loss_weight,
+            "ciou": avg_ciou * self.bbox_loss_weight,
             "objectness": avg_obj * self.obj_loss_weight,
             "classification": avg_cls * self.cls_loss_weight,
-            "positive_objectness": torch.stack(total_positive_obj_loss).mean()
+            "positive_objectness": avg_pos_obj
         }
     
     def repeat_for_cartesian(self, pred_list, gt_list, device):
@@ -104,20 +110,70 @@ class ObjectDetectionLoss(nn.Module):
 
         return pred_repeat, gt_repeat
     
-    def _compute_single_image_loss_global(self, pred_data, gt_data, device):
-        """Match predictions to ground truths globally."""
+    def _organize_by_grid(self, data_list):
+        """
+        Organize predictions/ground truths by their grid coordinates.
+        Returns: dict where key is (grid_i, grid_j) and value is list of objects in that cell
+        """
+        grid_dict = {}
+        for item in data_list:
+            grid_coord = item['grid']  # Should be tuple like (1, 2)
+            if grid_coord not in grid_dict:
+                grid_dict[grid_coord] = []
+            grid_dict[grid_coord].append(item)
+        return grid_dict
+    
+    def _compute_single_image_loss(self, pred_data, gt_data, device):
+        """Match predictions to ground truths in an image."""
+        pred_by_grid = self._organize_by_grid(pred_data)
+        gt_by_grid = self._organize_by_grid(gt_data)
+        all_grids = set(pred_by_grid.keys()) | set(gt_by_grid.keys())
+
+        ciou_losses = []
+        cls_losses = []
+        obj_losses = []
+        pos_obj_losses = []
+
+        for grid_coord in all_grids:
+            grid_preds = pred_by_grid.get(grid_coord, [])
+            grid_gts = gt_by_grid.get(grid_coord, [])
+
+            grid_losses = self._compute_single_grid_loss(grid_preds, grid_gts, device)
+            ciou_losses.append(grid_losses['ciou'])
+            cls_losses.append(grid_losses['classification'])
+            obj_losses.append(grid_losses['objectness'])
+            
+            # Safe append for positive objectness loss
+            if 'positive_objectness' in grid_losses and grid_losses['positive_objectness'] is not None:
+                pos_obj_losses.append(grid_losses['positive_objectness'])
+
+        # Safe stacking with empty list checks
+        ciou_loss = torch.stack(ciou_losses).mean() if ciou_losses else torch.tensor(0.0, device=device, requires_grad=True)
+        obj_loss = torch.stack(obj_losses).mean() if obj_losses else torch.tensor(0.0, device=device, requires_grad=True)
+        cls_loss = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=device, requires_grad=True)
+        pos_obj_loss = torch.stack(pos_obj_losses).mean() if pos_obj_losses else None
+
+        return {
+            "ciou": ciou_loss,
+            "objectness": obj_loss, 
+            "positive_objectness": pos_obj_loss,
+            "classification": cls_loss,
+        }
+    
+    def _compute_single_grid_loss(self, pred_data, gt_data, device):
+        """Match predictions to ground truths per grid."""
         
         # Initialize losses as tensors
-        siou_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        ciou_loss = torch.tensor(0.0, device=device, requires_grad=True)
         obj_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        pos_obj_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        pos_obj_loss = None  # Will be set only if there are positive matches
         cls_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         num_preds = len(pred_data)
         num_gts = len(gt_data)
         
         if num_preds == 0:
-            return {"siou": siou_loss, "objectness": obj_loss, "classification": cls_loss}
+            return {"ciou": ciou_loss, "objectness": obj_loss, "classification": cls_loss, "positive_objectness": pos_obj_loss}
         
         if num_gts == 0:
             # No ground truths: all predictions should have objectness = 0
@@ -129,14 +185,14 @@ class ObjectDetectionLoss(nn.Module):
                     pred_conf.unsqueeze(0), target_conf.unsqueeze(0), 
                     reduction='mean',
                     alpha= 0.5,
-                    gamma=2.5
+                    gamma=1.5
                 )
                 negative_obj_losses.append(neg_loss)
             
             if negative_obj_losses:
                 obj_loss = torch.stack(negative_obj_losses).mean() * self.neg_obj_weight
             
-            return {"siou": siou_loss, "objectness": obj_loss, "classification": cls_loss}
+            return {"ciou": ciou_loss, "objectness": obj_loss, "classification": cls_loss, "positive_objectness": pos_obj_loss}
         
         # Extract data for matching
         pred_bbox = [pred['bbox'] for pred in pred_data]
@@ -160,7 +216,7 @@ class ObjectDetectionLoss(nn.Module):
                 gt_xyxy = self._convert_to_xyxy(gt_bbox_repeat)
                 
                 ciou_matrix = complete_box_iou_loss(pred_xyxy, gt_xyxy, reduction='none').view(num_preds, num_gts)
-                cls_matrix = sigmoid_focal_loss(pred_class_repeat, gt_class_repeat, reduction='none', alpha= 0.5, gamma=1.0).mean(dim=1).view(num_preds, num_gts)
+                cls_matrix = sigmoid_focal_loss(pred_class_repeat, gt_class_repeat, reduction='none', alpha= 0.5, gamma=0.0).mean(dim=1).view(num_preds, num_gts)
                 
                 cost_matrix = (ciou_matrix + cls_matrix).detach().cpu().numpy()
                 
@@ -173,13 +229,13 @@ class ObjectDetectionLoss(nn.Module):
 
                 num_pos = len(matches)
                 num_neg = len(pred_data) - num_pos
-                alpha_positive = num_neg / (num_pos + num_neg)
+                alpha_positive = num_neg / (num_pos + num_neg) if (num_pos + num_neg) > 0 else 0.5
                 alpha_positive = max(min(alpha_positive, 0.85), 0.5) 
                 
                 ciou_losses = []
                 cls_losses = []
                 obj_losses = []
-                pos_obj_loss = []
+                pos_obj_loss_list = []
                 
                 for pred_idx, gt_idx in matches:
                     if pred_idx < num_preds and gt_idx < num_gts:
@@ -195,7 +251,7 @@ class ObjectDetectionLoss(nn.Module):
                             gt_class[gt_idx].unsqueeze(0), 
                             alpha= 0.5,
                             gamma=0.0
-                        )
+                        ) 
                         cls_losses.append(cls)
                         
                         # Objectness loss (positive)
@@ -207,7 +263,7 @@ class ObjectDetectionLoss(nn.Module):
                             gamma=0.0
                         ) * self.pos_obj_weight
                         obj_losses.append(obj)
-                        pos_obj_loss.append(obj)
+                        pos_obj_loss_list.append(obj)
                         
                         matched_pred_idx.append(pred_idx)
                         matched_gt_idx.append(gt_idx)
@@ -221,19 +277,19 @@ class ObjectDetectionLoss(nn.Module):
                         target_conf.unsqueeze(0), 
                         reduction ='mean',
                         alpha = 0.5,
-                        gamma = 2.0
+                        gamma = 1.5
                     ) * self.neg_obj_weight
                     obj_losses.append(neg_obj)
                 
-                # Aggregate losses
+                # Aggregate losses with safe stacking
                 if ciou_losses:
-                    siou_loss = torch.stack(ciou_losses).mean()
+                    ciou_loss = torch.stack(ciou_losses).mean()
                 if cls_losses:
                     cls_loss = torch.stack(cls_losses).mean()
                 if obj_losses:
                     obj_loss = torch.stack(obj_losses).mean()
-                if pos_obj_loss:
-                    pos_obj_loss = torch.stack(pos_obj_loss).mean()
+                if pos_obj_loss_list:
+                    pos_obj_loss = torch.stack(pos_obj_loss_list).mean()
                     
         except Exception as e:
             print(f"Error in loss computation: {e}")
@@ -241,7 +297,7 @@ class ObjectDetectionLoss(nn.Module):
             pass
         
         return {
-            "siou": siou_loss,
+            "ciou": ciou_loss,
             "objectness": obj_loss, 
             "positive_objectness": pos_obj_loss,
             "classification": cls_loss,

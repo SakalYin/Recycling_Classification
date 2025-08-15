@@ -7,7 +7,7 @@ import matplotlib.patches as patches
 class TrainingProcessor:
     def __init__(self, classes, input_size=448, grid_size=7, num_anchors=1):
         """
-        Initialize YOLO training data processor
+        Initialize training data processor
         
         Args:
             input_size: Model input image size
@@ -156,9 +156,9 @@ class TrainingProcessor:
 
         return image, boxes
     
-    def convert_to_yolo_target(self, boxes, original_size, get_anchors=False, warning=False):
+    def bbox2target(self, boxes, original_size, get_anchors=False, warning=False):
         """
-        Convert bounding boxes to YOLO training target format
+        Convert bounding boxes to training target format
         
         Args:
             boxes: List of [x1, y1, x2, y2, class_id]
@@ -254,11 +254,11 @@ class TrainingProcessor:
         else:
             image_tensor = self.val_transforms(image)
         
-        # Convert to YOLO target format
+        # Convert to model target format
         if get_anchors:
-            target_tensor, anchor_pose = self.convert_to_yolo_target(bboxes, original_size, get_anchors=get_anchors)
+            target_tensor, anchor_pose = self.bbox2target(bboxes, original_size, get_anchors=get_anchors)
         else:
-            target_tensor = self.convert_to_yolo_target(bboxes, original_size, get_anchors=get_anchors)
+            target_tensor = self.bbox2target(bboxes, original_size, get_anchors=get_anchors)
         
         if get_anchors:
             return image_tensor, target_tensor, anchor_pose
@@ -331,9 +331,9 @@ class TrainingProcessor:
         
         plt.show()
 
-    def convert_yolo_output_to_bboxes(self, output_tensor, class_tensor=False, grid=False, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None, is_training=True):
+    def convert_output_to_bboxes(self, output_tensor, class_tensor=False, grid=False, conf_threshold=None, input_size=None, num_classes=None, num_anchors=None, grid_size=None, is_training=True):
         """
-        Converts [S, S, B*(5+num_classes)] YOLO-style output to absolute bboxes.
+        Converts [S, S, B*(5+num_classes)] output to absolute bboxes.
         
         Args:
             output_tensor (Tensor): Shape [S, S, B*(5+num_classes)]
