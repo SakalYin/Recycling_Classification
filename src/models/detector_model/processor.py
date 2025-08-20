@@ -243,10 +243,10 @@ class TrainingProcessor:
         image = Image.open(image_path).convert('RGB')
         original_size = image.size
         
-        # Apply augmentations if training
-        if apply_augmentation:
-            image, bboxes = self.apply_horizontal_flip(image, bboxes)
-            image, bboxes = self.apply_random_crop(image, bboxes)
+        # # Apply augmentations if training
+        # if apply_augmentation:
+        #     image, bboxes = self.apply_horizontal_flip(image, bboxes)
+        #     image, bboxes = self.apply_random_crop(image, bboxes)
         
         # Apply transforms
         if apply_augmentation:

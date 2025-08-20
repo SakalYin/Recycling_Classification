@@ -141,6 +141,7 @@ class ObjectDetectionLoss(nn.Module):
             grid_losses = self._compute_single_grid_loss(grid_preds, grid_gts, device)
             ciou_losses.append(grid_losses['ciou'])
             cls_losses.append(grid_losses['classification'])
+            print(grid_losses['classification'])
             obj_losses.append(grid_losses['objectness'])
             
             # Safe append for positive objectness loss
@@ -249,8 +250,9 @@ class ObjectDetectionLoss(nn.Module):
                         cls = sigmoid_focal_loss(
                             pred_class[pred_idx].unsqueeze(0), 
                             gt_class[gt_idx].unsqueeze(0), 
-                            alpha= 0.5,
-                            gamma=0.0
+                            alpha= 0.25,
+                            gamma=0.0,
+                            reduction='mean'
                         ) 
                         cls_losses.append(cls)
                         

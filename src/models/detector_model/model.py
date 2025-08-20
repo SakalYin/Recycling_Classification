@@ -64,6 +64,104 @@ class ObjectDetectionModel(nn.Module):
         print(f"Trainable parameters:  {trainable_params:,}")
         print(f"Non-trainable params:  {non_trainable_params:,}")
         print(f"{'='*50}")
+
+class MobileObjectDetectionModel(nn.Module):
+    """Lightweight object detection model optimized for Raspberry Pi 5"""
+    def __init__(self, num_classes=20, num_anchors=3, grid_size=7, width_mult=0.5):
+        super(MobileObjectDetectionModel, self).__init__()
+        self.num_classes = num_classes
+        self.num_anchors = num_anchors
+        self.grid_size = grid_size
+        
+        # Calculate channel widths based on multiplier
+        ch64 = int(64 * width_mult)
+        ch128 = int(128 * width_mult)
+        ch256 = int(256 * width_mult)
+        
+        # Extremely lightweight backbone using depthwise separable convolutions
+        self.backbone = nn.Sequential(
+            # Initial conv
+            nn.Conv2d(3, ch64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(ch64),
+            nn.ReLU6(inplace=True),
+            
+            # Depthwise separable blocks
+            DepthwiseSeparableConv(ch64, ch128, stride=2),
+            DepthwiseSeparableConv(ch128, ch128, stride=1),
+            DepthwiseSeparableConv(ch128, ch256, stride=2),
+            DepthwiseSeparableConv(ch256, ch256, stride=1),
+            
+            # Global context with reduced spatial size
+            nn.AdaptiveAvgPool2d((grid_size, grid_size))
+        )
+        
+        # Ultra-light detection head
+        self.detector = nn.Sequential(
+            # Single refinement layer
+            DepthwiseSeparableConv(ch256, ch128, stride=1),
+            nn.Dropout2d(0.1),
+            
+            # Direct prediction
+            nn.Conv2d(ch128, num_anchors * (5 + num_classes), kernel_size=1)
+        )
+        
+        # Initialize for mobile deployment
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # Single forward pass through backbone (includes pooling)
+        features = self.backbone(x)
+        
+        # Direct prediction
+        predictions = self.detector(features)
+        predictions = predictions.permute(0, 2, 3, 1).contiguous()
+        
+        return predictions
+
+    def count_parameters(self):
+        model = self
+        """
+        Count total and trainable parameters in a PyTorch model
+        """
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        non_trainable_params = total_params - trainable_params
+
+        print(f"{'='*50}")
+        print(f"MODEL PARAMETER SUMMARY")
+        print(f"{'='*50}")
+        print(f"Total parameters:      {total_params:,}")
+        print(f"Trainable parameters:  {trainable_params:,}")
+        print(f"Non-trainable params:  {non_trainable_params:,}")
+        print(f"{'='*50}")
+
+class DepthwiseSeparableConv(nn.Module):
+    """Memory and compute efficient depthwise separable convolution"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(DepthwiseSeparableConv, self).__init__()
+        
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, stride=stride, 
+            padding=1, groups=in_channels, bias=False
+        )
+        self.pointwise = nn.Conv2d(
+            in_channels, out_channels, kernel_size=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+    
+    def forward(self, x):
+        x = F.relu6(self.bn1(self.depthwise(x)), inplace=True)
+        x = F.relu6(self.bn2(self.pointwise(x)), inplace=True)
+        return x
     
 
 class AdaptiveObjectDetectionHead(nn.Module):
