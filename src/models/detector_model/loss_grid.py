@@ -26,9 +26,9 @@ class ObjectDetectionLoss(nn.Module):
         batch_size = outputs.shape[0]
         device = outputs.device
         
-        total_ciou = 0.0
-        total_obj = 0.0
-        total_cls = 0.0
+        total_ciou = []
+        total_obj = []
+        total_cls = []
         total_positive_obj_loss = []
         valid_samples = 0
 
@@ -42,9 +42,11 @@ class ObjectDetectionLoss(nn.Module):
                 )
                 
                 loss_dict = self._compute_single_image_loss(pred_data, gt_data, device)
-                total_ciou += loss_dict["ciou"]
-                total_obj += loss_dict["objectness"]
-                total_cls += loss_dict["classification"]
+                total_obj.append(loss_dict["objectness"])
+                if loss_dict['ciou'] > 0:
+                    total_ciou.append(loss_dict["ciou"])
+                if loss_dict["classification"] > 0:
+                    total_cls.append(loss_dict["classification"])
                 
                 # Safe append for positive objectness loss
                 if "positive_objectness" in loss_dict and loss_dict["positive_objectness"] is not None:
@@ -68,9 +70,9 @@ class ObjectDetectionLoss(nn.Module):
             }
         
         # Average over valid samples
-        avg_ciou = total_ciou / valid_samples
-        avg_obj = total_obj / valid_samples  
-        avg_cls = total_cls / valid_samples
+        avg_ciou = torch.stack(total_ciou).mean()
+        avg_obj = torch.stack(total_obj).mean()
+        avg_cls = torch.stack(total_cls).mean()
         
         # Handle positive objectness loss safely
         if total_positive_obj_loss:
@@ -139,10 +141,12 @@ class ObjectDetectionLoss(nn.Module):
             grid_gts = gt_by_grid.get(grid_coord, [])
 
             grid_losses = self._compute_single_grid_loss(grid_preds, grid_gts, device)
-            ciou_losses.append(grid_losses['ciou'])
-            cls_losses.append(grid_losses['classification'])
-            print(grid_losses['classification'])
-            obj_losses.append(grid_losses['objectness'])
+            if grid_losses['ciou'] > 0:
+                ciou_losses.append(grid_losses['ciou'])
+            if grid_losses['classification'] > 0:
+                cls_losses.append(grid_losses['classification'])
+            if grid_losses['objectness'] > 0:
+                obj_losses.append(grid_losses['objectness'])
             
             # Safe append for positive objectness loss
             if 'positive_objectness' in grid_losses and grid_losses['positive_objectness'] is not None:
@@ -252,7 +256,7 @@ class ObjectDetectionLoss(nn.Module):
                             gt_class[gt_idx].unsqueeze(0), 
                             alpha= 0.25,
                             gamma=0.0,
-                            reduction='mean'
+                            reduction='mean'    
                         ) 
                         cls_losses.append(cls)
                         

@@ -81,9 +81,9 @@ class ObjectDetectionLoss(nn.Module):
         
         return {
             "total": weighted_total,
-            "siou": avg_siou * self.bbox_loss_weight,
-            "objectness": avg_obj * self.obj_loss_weight,
-            "classification": avg_cls * self.cls_loss_weight,
+            "siou": avg_siou,
+            "objectness": avg_obj,
+            "classification": avg_cls,
             "positive_objectness": torch.stack(total_positive_obj_loss).mean()
         }
     
